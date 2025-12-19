@@ -139,3 +139,19 @@ await sios.testRaceCondition?.();
 // Test JSON error
 await sios.testJsonRetry?.();
 ```
+## Kabeh Methods:
+```javascript
+sios.get(url, config)
+sios.post(url, data, config)
+sios.put(url, data, config)
+sios.patch(url, data, config)
+sios.delete(url, config)
+sios.head(url, config)
+sios.options(url, config)
+sios.upload(url, file, config)
+sios.multiupload(url, files, config)
+sios.intercept(type, handler)
+sios.cancel(requestId)
+sios.cancelAll()
+sios.create(config)
+```
