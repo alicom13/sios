@@ -1,6 +1,6 @@
 {
   "name": "sios",
-  "version": "1.0.0",
+  "version": "1.3.0",
   "description": "Sios is Ultra-minimal HTTP client inspired by Axios",
   "main": "src/sios.js",
   "scripts": {
