@@ -1,0 +1,16 @@
+{
+  "name": "sios",
+  "version": "1.0.0",
+  "description": "Sios is Ultra-minimal HTTP client inspired by Axios",
+  "main": "src/sios.js",
+  "scripts": {
+    "test": "echo \"No tests yet\""
+  },
+  "keywords": ["http", "client", "axios", "sios", "fetch"],
+  "author": "Ali Musthofa",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/alicom13/sios"
+  }
+}
