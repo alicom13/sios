@@ -1,920 +1,442 @@
 /*!
- * Sios v1.3.0 - Sios JS
+ * Sios v1.3.3 - Sios JS
  * Production-ready HTTP client inspired by Axios
  * @copyright  2025 Sios JS Tim
  * @author    Ali Musthofa
  * @link      https://github.com/alicom13/sios
  * @license   MIT
  */
-
 class Sios {
-  constructor(config = {}) {
-    this.defaults = {
+  constructor(cfg = {}) {
+    if (cfg && typeof cfg !== 'object') {
+      console.warn('Sios: config harus object');
+    }
+
+    this.def = {
       baseURL: '',
       timeout: 10000,
       headers: { 'Accept': 'application/json' },
-      validateStatus: (status) => status >= 200 && status < 300,
-      responseType: 'json',
+      validateStatus: s => s >= 200 && s < 300,
       withCredentials: false,
       maxRetries: 0,
       retryDelay: 1000,
       maxRetryDelay: 30000,
-      strictInterceptors: false,
       retryOnJsonError: false,
-      retryCondition: (error, attempt, config) => {
-        const baseCondition = (
-          error.code === 'NETWORK' || 
-          error.code?.startsWith('HTTP_5')
-        ) && attempt < config.maxRetries;
-        
-        if (config.retryOnJsonError && error.code === 'JSON_PARSE_ERROR') {
-          console.log(`[JSON Error Retry] Attempt ${attempt + 1}/${config.maxRetries}`);
-          return baseCondition;
-        }
-        
-        return baseCondition && ![501, 505].includes(
-          parseInt(error.code.split('_')[1] || 0)
-        );
-      },
-      ...config
+      retryCond: this._defRetryCond,
+      ...cfg
     };
     
-    this.interceptors = { request: [], response: [] };
-    this.activeRequests = new Map();
-    this.requestCount = 0;
+    this.icpt = { req: [], res: [] };
+    this.activeReqs = new Map();
+    this.cch = new Map();
+    this.mtr = { tot: 0, ok: 0, fail: 0, ch: 0 };
   }
-  
-  async request(method, url, data = null, config = {}) {
-    const requestId = this._generateRequestId();
-    
-    const requestState = {
-      id: requestId,
-      controller: null,
-      delayController: null,
-      cancelledManually: false,
-      timeoutId: null,
-      timestamp: Date.now(),
-      config: null,
-      currentAttempt: 0,
-      maxAttempts: 0,
-      isTimedOut: false,
-      state: 'pending',
-      cleanupCallbacks: []
-    };
-    
-    this.activeRequests.set(requestId, requestState);
-    
-    const promise = (async () => {
-      try {
-        const baseConfig = this._mergeConfig(method, url, data, config);
-        requestState.config = baseConfig;
-        requestState.maxAttempts = baseConfig.maxRetries + 1;
-        
-        const finalUrl = this._buildFinalUrl(baseConfig, requestId);
-        const processedConfig = { 
-          ...baseConfig, 
-          url: finalUrl
-        };
-        
-        let interceptorConfig = processedConfig;
-        for (const interceptor of this.interceptors.request) {
-          const result = this._executeInterceptor(
-            interceptor,
-            interceptorConfig,
-            'request',
-            interceptorConfig.strictInterceptors
-          );
-          
-          if (!result || typeof result !== 'object' || Array.isArray(result)) {
-            throw new SiosError(
-              'Request interceptor must return config object',
-              'INTERCEPTOR_ERROR',
-              interceptorConfig
-            );
-          }
-          
-          if (!result.method || !result.url) {
-            throw new SiosError(
-              'Request interceptor must preserve method and url',
-              'INTERCEPTOR_ERROR',
-              result
-            );
-          }
-          
-          interceptorConfig = await result;
-        }
-        
-        requestState.controller = new AbortController();
-        interceptorConfig.signal = requestState.controller.signal;
-        
-        const clonedConfig = {
-          ...interceptorConfig,
-          headers: { ...interceptorConfig.headers }
-        };
-        
-        const requestInit = this._buildRequestInit(clonedConfig);
-        
-        const response = await this._executeWithRetryManagement(
-          clonedConfig.url,
-          requestInit,
-          clonedConfig,
-          requestState
-        );
-        
-        if (requestState.cancelledManually) {
-          throw new SiosError('Request cancelled', 'CANCELLED', clonedConfig);
-        }
-        
-        const processed = await this._safeProcessResponse(
-          response, 
-          clonedConfig,
-          requestState
-        );
-        
-        if (!clonedConfig.validateStatus(processed.status)) {
-          const error = new SiosError(
-            `Request failed with status ${processed.status}`,
-            `HTTP_${processed.status}`,
-            clonedConfig,
-            processed
-          );
-          error.requestId = requestId;
-          throw error;
-        }
-        
-        let finalResponse = {
-          ...processed,
-          config: clonedConfig,
-          requestId,
-          status: response.status
-        };
-        
-        for (const interceptor of this.interceptors.response) {
-          const result = this._executeInterceptor(
-            interceptor,
-            finalResponse,
-            'response',
-            clonedConfig.strictInterceptors
-          );
-          
-          if (result) {
-            const resolvedResult = await result;
-            if (resolvedResult && typeof resolvedResult === 'object' && !Array.isArray(resolvedResult)) {
-              finalResponse = resolvedResult;
-            } else if (clonedConfig.strictInterceptors) {
-              throw new SiosError(
-                'Response interceptor must return response object',
-                'INTERCEPTOR_ERROR',
-                clonedConfig
-              );
-            }
-          }
-        }
-        
-        requestState.state = 'finished';
-        return finalResponse;
-        
-      } catch (error) {
-        if (requestState.cancelledManually) {
-          requestState.state = 'cancelled';
-          const cancelledError = new SiosError(
-            'Request cancelled manually',
-            'CANCELLED',
-            requestState.config
-          );
-          cancelledError.requestId = requestId;
-          throw cancelledError;
-        }
-        
-        if (requestState.isTimedOut) {
-          const timeoutError = new SiosError(
-            `Request timeout after ${requestState.config?.timeout || 10000}ms`,
-            'TIMEOUT',
-            requestState.config
-          );
-          timeoutError.requestId = requestId;
-          throw timeoutError;
-        }
-        
-        const enhanced = error instanceof SiosError 
-          ? error 
-          : this._createSiosError(error, requestState.config || config, requestId);
-        
-        enhanced.requestId = requestId;
-        
-        let finalError = enhanced;
-        for (const interceptor of this.interceptors.response) {
-          if (interceptor.onRejected) {
-            try {
-              const result = await this._executeInterceptor(
-                { onFulfilled: interceptor.onRejected },
-                finalError,
-                'error',
-                requestState.config?.strictInterceptors
-              );
-              
-              if (result) {
-                const resolvedResult = await result;
-                if (resolvedResult && typeof resolvedResult === 'object' && !Array.isArray(resolvedResult)) {
-                  finalError = resolvedResult;
-                } else if (requestState.config?.strictInterceptors) {
-                  throw new SiosError(
-                    'Error interceptor must return error object',
-                    'INTERCEPTOR_ERROR',
-                    requestState.config
-                  );
-                }
-              }
-            } catch (interceptorError) {
-              if (requestState.config?.strictInterceptors) {
-                throw new SiosError(
-                  `Error interceptor failed: ${interceptorError.message}`,
-                  'INTERCEPTOR_ERROR',
-                  requestState.config,
-                  null,
-                  interceptorError
-                );
-              }
-            }
-          }
-        }
-        
-        throw finalError;
-      } finally {
-        this._cleanupRequest(requestId, requestState);
-      }
-    })();
-    
-    promise.requestId = requestId;
-    return promise;
-  }
-  
-  _executeInterceptor(interceptor, value, type, strictMode) {
-    if (interceptor.onFulfilled) {
-      const result = interceptor.onFulfilled(value);
-      return Promise.resolve(result);
-    } else if (typeof interceptor === 'function') {
-      const result = interceptor(value);
-      return Promise.resolve(result);
+
+  _defRetryCond(err, att, cfg) {
+    if (err.code === 'TIMEOUT' || err.code === 'NETWORK') return true;
+    if (err.code && err.code.startsWith('HTTP_5')) {
+      const s = parseInt(err.code.split('_')[1]);
+      return ![501, 505].includes(s);
     }
-    return Promise.resolve(value);
-  }
-  
-  _generateRequestId() {
-    this.requestCount++;
-    return `sios_${Date.now()}_${this.requestCount}_${Math.random().toString(36).slice(2, 9)}`;
-  }
-  
-  _buildFinalUrl(config, requestId) {
-    let finalUrl = config.url;
-    const isAbsolute = this._isAbsoluteUrl(finalUrl);
-    
-    if (config.baseURL && !isAbsolute) {
-      const base = config.baseURL.endsWith('/') ? config.baseURL.slice(0, -1) : config.baseURL;
-      const path = finalUrl.startsWith('/') ? finalUrl : `/${finalUrl}`;
-      finalUrl = base + path;
-    }
-    
-    if (config.params && Object.keys(config.params).length > 0) {
-      const paramsResult = this._applyParamsWithEncoding(finalUrl, config.params, isAbsolute);
-      if (paramsResult.success) {
-        finalUrl = paramsResult.url;
-      } else {
-        console.warn(`[${requestId}] Using fallback params encoding`);
-        finalUrl = paramsResult.url;
-      }
-    }
-    
-    return finalUrl;
-  }
-  
-  _isAbsoluteUrl(url) {
-    return url.startsWith('http://') || url.startsWith('https://') || url.startsWith('//');
-  }
-  
-  _applyParamsWithEncoding(url, params, isAbsolute = false) {
-    const urlObj = new URL(url, isAbsolute ? undefined : 'http://dummy.com');
-    
-    Object.entries(params).forEach(([key, value]) => {
-      if (value != null) {
-        const encodedKey = encodeURIComponent(key);
-        const encodedValue = encodeURIComponent(String(value));
-        urlObj.searchParams.append(encodedKey, encodedValue);
-      }
-    });
-    
-    if (isAbsolute) {
-      return { success: true, url: urlObj.toString() };
-    } else {
-      const pathAndQuery = urlObj.pathname + urlObj.search + urlObj.hash;
-      return { success: true, url: pathAndQuery };
-    }
-  }
-  
-  _fallbackApplyParams(url, params) {
-    const queryParams = [];
-    
-    Object.entries(params).forEach(([key, value]) => {
-      if (value != null) {
-        const encodedKey = encodeURIComponent(key);
-        const encodedValue = encodeURIComponent(String(value));
-        queryParams.push(`${encodedKey}=${encodedValue}`);
-      }
-    });
-    
-    if (queryParams.length === 0) return url;
-    
-    const separator = url.includes('?') ? '&' : '?';
-    return url + separator + queryParams.join('&');
-  }
-  
-  async _executeWithRetryManagement(url, init, config, requestState) {
-    let lastError = null;
-    
-    for (requestState.currentAttempt = 0; 
-         requestState.currentAttempt < requestState.maxAttempts; 
-         requestState.currentAttempt++) {
-      
-      if (requestState.cancelledManually) {
-        requestState.state = 'cancelled';
-        throw new SiosError('Request cancelled', 'CANCELLED', config);
-      }
-      
-      if (requestState.currentAttempt > 0) {
-        requestState.state = 'retrying';
-        
-        const baseDelay = config.retryDelay * Math.pow(2, requestState.currentAttempt - 1);
-        const delay = Math.min(baseDelay, config.maxRetryDelay);
-        
-        const cancelled = await this._efficientDelay(delay, requestState);
-        if (cancelled) {
-          requestState.state = 'cancelled';
-          throw new SiosError('Request cancelled during retry delay', 'CANCELLED', config);
-        }
-        
-        this._ensureCleanListeners(requestState);
-        requestState.controller = new AbortController();
-        init.signal = requestState.controller.signal;
-      }
-      
-      try {
-        const clonedInit = {
-          ...init,
-          headers: { ...init.headers },
-          signal: requestState.controller.signal
-        };
-        
-        const result = await this._executeSingleRequest(
-          url, 
-          clonedInit, 
-          config, 
-          requestState
-        );
-        return result;
-      } catch (error) {
-        lastError = error;
-        
-        if (error.code === 'CANCELLED' || error.code === 'TIMEOUT') {
-          throw error;
-        }
-        
-        const shouldRetry = requestState.currentAttempt < requestState.maxAttempts - 1 &&
-          config.retryCondition(error, requestState.currentAttempt, config);
-        
-        if (!shouldRetry) {
-          throw error;
-        }
-        
-        continue;
-      }
-    }
-    
-    throw lastError;
-  }
-  
-  _ensureCleanListeners(requestState) {
-    if (requestState.controller && requestState.controller.signal) {
-      const signal = requestState.controller.signal;
-      signal.abort();
-    }
-    
-    requestState.cleanupCallbacks.forEach(cb => cb());
-    requestState.cleanupCallbacks = [];
-  }
-  
-  _efficientDelay(ms, requestState) {
-    return new Promise(resolve => {
-      requestState.delayController = new AbortController();
-      const delaySignal = requestState.delayController.signal;
-      
-      const timeoutId = setTimeout(() => {
-        if (!delaySignal.aborted) {
-          resolve(false);
-        }
-      }, ms);
-      
-      const abortHandler = () => {
-        clearTimeout(timeoutId);
-        resolve(true);
-      };
-      
-      delaySignal.addEventListener('abort', abortHandler);
-      
-      if (requestState.controller && requestState.controller.signal) {
-        requestState.controller.signal.addEventListener('abort', abortHandler);
-      }
-      
-      requestState.cleanupCallbacks.push(() => {
-        clearTimeout(timeoutId);
-        delaySignal.removeEventListener('abort', abortHandler);
-        
-        if (requestState.controller && requestState.controller.signal) {
-          requestState.controller.signal.removeEventListener('abort', abortHandler);
-        }
-        
-        if (requestState.delayController && !requestState.delayController.signal.aborted) {
-          requestState.delayController.abort();
-        }
-        requestState.delayController = null;
-      });
-    });
-  }
-  
-  async _executeSingleRequest(url, init, config, requestState) {
-    return new Promise((resolve, reject) => {
-      requestState.timeoutId = setTimeout(() => {
-        requestState.isTimedOut = true;
-        requestState.controller.abort();
-        
-        const error = new SiosError(
-          `Request timeout after ${config.timeout}ms`,
-          'TIMEOUT',
-          config
-        );
-        error.requestId = requestState.id;
-        reject(error);
-      }, config.timeout);
-      
-      requestState.cleanupCallbacks.push(() => {
-        if (requestState.timeoutId) {
-          clearTimeout(requestState.timeoutId);
-          requestState.timeoutId = null;
-        }
-      });
-      
-      const fetchInit = {
-        ...init,
-        headers: { ...init.headers }
-      };
-      
-      fetch(url, fetchInit)
-        .then(response => {
-          if (requestState.cancelledManually) {
-            reject(new SiosError('Request cancelled', 'CANCELLED', config));
-            return;
-          }
-          
-          if (requestState.timeoutId) {
-            clearTimeout(requestState.timeoutId);
-            requestState.timeoutId = null;
-          }
-          
-          requestState.isTimedOut = false;
-          resolve(response);
-        })
-        .catch(error => {
-          if (requestState.timeoutId) {
-            clearTimeout(requestState.timeoutId);
-            requestState.timeoutId = null;
-          }
-          
-          if (error.name === 'AbortError') {
-            if (requestState.isTimedOut) {
-              const timeoutError = new SiosError(
-                `Request timeout after ${config.timeout}ms`,
-                'TIMEOUT',
-                config
-              );
-              timeoutError.requestId = requestState.id;
-              reject(timeoutError);
-              return;
-            }
-            
-            if (requestState.cancelledManually) {
-              reject(new SiosError('Request cancelled', 'CANCELLED', config));
-              return;
-            }
-            
-            reject(new SiosError('Request aborted', 'ABORTED', config));
-            return;
-          }
-          
-          const isNetworkError = this._isNetworkError(error);
-          reject(new SiosError(
-            isNetworkError ? 'Network error' : error.message || 'Request failed',
-            isNetworkError ? 'NETWORK' : 'UNKNOWN',
-            config
-          ));
-        });
-    });
-  }
-  
-  cancel(requestId) {
-    const requestState = this.activeRequests.get(requestId);
-    if (requestState) {
-      requestState.cancelledManually = true;
-      requestState.state = 'cancelled';
-      
-      if (requestState.controller) {
-        requestState.controller.abort();
-      }
-      
-      if (requestState.delayController) {
-        requestState.delayController.abort();
-      }
-      
-      requestState.cleanupCallbacks.forEach(cb => cb());
-      requestState.cleanupCallbacks = [];
-      
-      return true;
-    }
+    if (cfg.retryOnJsonError && err.code === 'JSON_PARSE_ERROR') return true;
     return false;
   }
-  
-  cancelAll() {
-    const snapshot = Array.from(this.activeRequests.entries());
-    snapshot.forEach(([id]) => this.cancel(id));
-  }
-  
-  _cleanupRequest(requestId, requestState) {
-    if (requestState) {
-      if (requestState.delayController && !requestState.delayController.signal.aborted) {
-        requestState.delayController.abort();
-      }
-      
-      requestState.cleanupCallbacks.forEach(cb => cb());
-      requestState.cleanupCallbacks = [];
-      requestState.controller = null;
-      requestState.delayController = null;
-      requestState.timeoutId = null;
-    }
+
+  async req(method, url, dt = null, cfg = {}) {
+    const rid = this._genId();
+    this.mtr.tot++;
     
-    this.activeRequests.delete(requestId);
-  }
-  
-  async _safeProcessResponse(response, config, requestState) {
-    const headers = {};
-    response.headers.forEach((value, key) => {
-      headers[key] = value;
-    });
+    const abortCtrls = new Map();
+    const rState = { stop: false };
+    const initCtrl = new AbortController();
+    abortCtrls.set(0, initCtrl);
     
-    const result = {
-      data: null,
-      status: response.status,
-      statusText: response.statusText,
-      headers,
-      config
-    };
-    
-    let responseToParse = response;
-    let cloned = false;
-    
-    if (response.body && !response.bodyUsed) {
-      try {
-        responseToParse = response.clone();
-        cloned = true;
-      } catch {
-        cloned = false;
-      }
-    }
-    
-    switch (config.responseType) {
-      case 'text':
-        result.data = await responseToParse.text();
-        break;
-      case 'blob':
-        result.data = await responseToParse.blob();
-        break;
-      case 'arraybuffer':
-        result.data = await responseToParse.arrayBuffer();
-        break;
-      case 'json':
-        try {
-          const text = await responseToParse.text();
-          if (text) {
-            result.data = JSON.parse(text);
-          } else {
-            result.data = null;
-          }
-        } catch (parseError) {
-          const jsonError = new SiosError(
-            'Failed to parse JSON response',
-            'JSON_PARSE_ERROR',
-            config,
-            result,
-            parseError
-          );
-          
-          if (config.retryOnJsonError && requestState) {
-            console.log(`[JSON Parse Error] ${cloned ? 'Cloned' : 'Original'} response failed`);
-            throw jsonError;
-          }
-          
-          result.data = null;
-        }
-        break;
-      default:
-        const contentType = response.headers.get('content-type');
-        if (contentType && contentType.includes('application/json')) {
-          try {
-            const text = await responseToParse.text();
-            result.data = text ? JSON.parse(text) : null;
-          } catch (parseError) {
-            const jsonError = new SiosError(
-              'Failed to parse JSON response',
-              'JSON_PARSE_ERROR',
-              config,
-              result,
-              parseError
-            );
-            
-            if (config.retryOnJsonError && requestState) {
-              console.log(`[JSON Parse Error] ${cloned ? 'Cloned' : 'Original'} response failed`);
-              throw jsonError;
-            }
-            
-            result.data = null;
-          }
-        } else {
-          result.data = await responseToParse.text();
-        }
-    }
-    
-    return result;
-  }
-  
-  _mergeConfig(method, url, data, config) {
-    const { headers: configHeaders, params, ...restConfig } = config;
-    const { headers: defaultHeaders, ...defaults } = this.defaults;
-    
-    const merged = {
-      ...defaults,
-      ...restConfig,
-      method: method.toUpperCase(),
-      url,
-      data,
-      params
-    };
-    
-    merged.headers = { ...defaultHeaders, ...configHeaders };
-    return merged;
-  }
-  
-  _buildRequestInit(config) {
-    const init = {
-      method: config.method,
-      headers: { ...config.headers },
-      signal: config.signal,
-      credentials: config.withCredentials ? 'include' : 'same-origin',
-      redirect: 'follow'
-    };
-    
-    if (config.data != null && !['GET', 'HEAD', 'OPTIONS'].includes(config.method)) {
-      if (config.data instanceof FormData) {
-        init.body = config.data;
-        if (!config.headers['Content-Type']) {
-          delete init.headers['Content-Type'];
-        }
-      } else if (typeof config.data === 'object') {
-        init.body = JSON.stringify(config.data);
-        if (!init.headers['Content-Type']) {
-          init.headers['Content-Type'] = 'application/json';
-        }
-      } else {
-        init.body = config.data;
-      }
-    }
-    
-    return init;
-  }
-  
-  _createSiosError(error, config, requestId) {
-    let code = error.code || 'UNKNOWN';
-    let message = error.message || 'Request failed';
-    
-    if (!error.code && error.message) {
-      if (error.message.includes('timeout')) code = 'TIMEOUT';
-      else if (error.message.includes('cancelled')) code = 'CANCELLED';
-      else if (error.message.includes('aborted')) code = 'ABORTED';
-    }
-    
-    return new SiosError(
-      message,
-      code,
-      config,
-      error.response,
-      error
-    );
-  }
-  
-  _isNetworkError(error) {
-    if (typeof navigator !== 'undefined' && !navigator.onLine) {
-      return true;
-    }
-    
-    if (error.message && (
-      error.message.includes('Failed to fetch') ||
-      error.message.includes('NetworkError') ||
-      error.message.includes('Network request failed')
-    )) {
-      return true;
-    }
-    
-    return false;
-  }
-  
-  _formatBytes(bytes, decimals = 2) {
-    if (bytes === 0) return '0 Bytes';
-    
-    const k = 1024;
-    const dm = Math.max(0, decimals);
-    const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB', 'YB'];
+    this.activeReqs.set(rid, { abortCtrls, rState, curAtt: 0 });
     
     try {
-      if (typeof bytes === 'bigint') {
-        let index = 0;
-        let temp = bytes;
-        while (temp >= 1024n && index < sizes.length - 1) {
-          temp /= 1024n;
-          index++;
+      const mergedCfg = this._mergeCfg(method, url, dt, cfg);
+      mergedCfg.signal = initCtrl.signal;
+      
+      if (method === 'GET' && cfg.cache) {
+        const cKey = this._genCacheKey(method, url, cfg.params, dt);
+        const cached = this.cch.get(cKey);
+        if (cached && Date.now() < cached.exp) {
+          this.mtr.ch++;
+          this.mtr.ok++;
+          return { ...cached.dt, cached: true, rid };
+        }
+      }
+      
+      let finalCfg = mergedCfg;
+      for (const icp of this.icpt.req) {
+        const fn = icp.onOk || icp;
+        finalCfg = await Promise.resolve(fn(finalCfg));
+      }
+      
+      const res = await this._exec(finalCfg, rid, rState, abortCtrls);
+      const processed = await this._proc(res, finalCfg);
+      
+      if (method === 'GET' && cfg.cache) {
+        const cKey = this._genCacheKey(method, url, cfg.params, dt);
+        this.cch.set(cKey, { dt: processed, exp: Date.now() + (cfg.cacheTTL || 60000) });
+      }
+      
+      let finalRes = { ...processed, rid, cfg: finalCfg };
+      for (const icp of this.icpt.res) {
+        if (icp.onOk) {
+          finalRes = await Promise.resolve(icp.onOk(finalRes));
+        }
+      }
+      
+      this.mtr.ok++;
+      return finalRes;
+      
+    } catch (err) {
+      this.mtr.fail++;
+      let finalErr = err;
+      
+      if (!err.isSiosError) {
+        finalErr = new SiosError(
+          err.message || 'Unknown error',
+          err.name === 'AbortError' ? 'CANCELLED' : 
+          err.name === 'TimeoutError' ? 'TIMEOUT' : 'UNKNOWN',
+          cfg,
+          null,
+          err
+        );
+      }
+      
+      for (const icp of this.icpt.res) {
+        if (icp.onFail) {
+          try {
+            finalErr = await Promise.resolve(icp.onFail(finalErr));
+          } catch {}
+        }
+      }
+      
+      throw finalErr;
+    } finally {
+      this.activeReqs.delete(rid);
+    }
+  }
+
+  _mergeCfg(method, url, dt, cfg) {
+    let fUrl;
+    try {
+      if (this.def.baseURL) {
+        fUrl = new URL(url, this.def.baseURL).href;
+      } else {
+        fUrl = url;
+      }
+    } catch (e) {
+      console.warn(`Sios: Invalid URL (baseURL: "${this.def.baseURL}", url: "${url}")`);
+      fUrl = url;
+    }
+    
+    return {
+      ...this.def,
+      method: method.toUpperCase(),
+      url: fUrl,
+      dt,
+      headers: { ...this.def.headers, ...cfg.headers },
+      ...cfg
+    };
+  }
+
+  async _exec(cfg, rid, rState, abortCtrls) {
+    let lastErr;
+    
+    for (let att = 0; att <= cfg.maxRetries; att++) {
+      const reqState = this.activeReqs.get(rid);
+      if (reqState) reqState.curAtt = att;
+      
+      if (rState.stop) throw new SiosError('Cancelled', 'CANCELLED', cfg);
+      
+      if (att > 0) {
+        if (rState.stop) throw new SiosError('Cancelled', 'CANCELLED', cfg);
+        
+        const delay = this._calcDelay(att, cfg.retryDelay, cfg.maxRetryDelay);
+        await this._wait(delay);
+        
+        abortCtrls.forEach(ctrl => {
+          if (!ctrl.signal.aborted) ctrl.abort();
+        });
+        
+        const newCtrl = new AbortController();
+        abortCtrls.set(att, newCtrl);
+        cfg.signal = newCtrl.signal;
+      }
+      
+      try {
+        const tmo = new Promise((_, reject) =>
+          setTimeout(() => reject(new SiosError(
+            `Timeout ${cfg.timeout}ms`,
+            'TIMEOUT',
+            cfg
+          )), cfg.timeout)
+        );
+        
+        const opts = {
+          method: cfg.method,
+          headers: { ...cfg.headers },
+          signal: cfg.signal,
+          credentials: cfg.withCredentials ? 'include' : 'same-origin',
+          redirect: 'follow'
+        };
+        
+        if (cfg.dt && !['GET', 'HEAD'].includes(cfg.method)) {
+          if (cfg.dt instanceof FormData) {
+            opts.body = cfg.dt;
+            if (opts.headers['Content-Type']) delete opts.headers['Content-Type'];
+          } else if (typeof cfg.dt === 'object') {
+            opts.body = JSON.stringify(cfg.dt);
+            if (!opts.headers['Content-Type']) opts.headers['Content-Type'] = 'application/json';
+          } else {
+            opts.body = cfg.dt;
+          }
         }
         
-        const divisor = BigInt(k) ** BigInt(index);
-        const whole = bytes / divisor;
-        const remainder = bytes % divisor;
+        const fetchProm = fetch(cfg.url, opts);
+        const res = await Promise.race([fetchProm, tmo]);
         
-        const value = Number(whole) + Number(remainder) / Number(divisor);
-        return parseFloat(value.toFixed(dm)) + ' ' + sizes[index];
-      } else {
-        const i = Math.floor(Math.log(bytes) / Math.log(k));
-        const index = Math.min(i, sizes.length - 1);
-        const value = bytes / Math.pow(k, index);
-        return parseFloat(value.toFixed(dm)) + ' ' + sizes[index];
+        if (!cfg.validateStatus(res.status)) {
+          const temp = {
+            dt: null,
+            status: res.status,
+            statusText: res.statusText,
+            headers: {},
+            cfg
+          };
+          
+          res.headers.forEach((v, k) => temp.headers[k] = v);
+          throw new SiosError(`HTTP ${res.status}`, `HTTP_${res.status}`, cfg, temp);
+        }
+        
+        return res;
+        
+      } catch (err) {
+        lastErr = err;
+        if (err.code === 'CANCELLED') throw err;
+        
+        const shouldRetry = cfg.retryCond(err, att, cfg);
+        if (!shouldRetry) {
+          if (!err.isSiosError) {
+            throw new SiosError(err.message || 'Network error', 'NETWORK', cfg, null, err);
+          }
+          throw err;
+        }
       }
-    } catch {
-      return bytes.toString() + ' Bytes';
-    }
-  }
-  
-  getActiveRequests() {
-    return Array.from(this.activeRequests.entries())
-      .filter(([_, info]) => info.config)
-      .map(([id, info]) => ({
-        id,
-        url: info.config.url || '',
-        method: info.config.method || 'GET',
-        timestamp: info.timestamp,
-        state: info.state,
-        cancelled: info.cancelledManually,
-        attempt: info.currentAttempt,
-        maxAttempts: info.maxAttempts
-      }));
-  }
-  
-  get(url, config = {}) { 
-    const promise = this.request('GET', url, null, config);
-    promise.requestId = promise.requestId;
-    return promise;
-  }
-  
-  post(url, data = null, config = {}) { 
-    const promise = this.request('POST', url, data, config);
-    promise.requestId = promise.requestId;
-    return promise;
-  }
-  
-  put(url, data = null, config = {}) { 
-    const promise = this.request('PUT', url, data, config);
-    promise.requestId = promise.requestId;
-    return promise;
-  }
-  
-  patch(url, data = null, config = {}) { 
-    const promise = this.request('PATCH', url, data, config);
-    promise.requestId = promise.requestId;
-    return promise;
-  }
-  
-  delete(url, config = {}) { 
-    const promise = this.request('DELETE', url, null, config);
-    promise.requestId = promise.requestId;
-    return promise;
-  }
-  
-  head(url, config = {}) { 
-    const promise = this.request('HEAD', url, null, config);
-    promise.requestId = promise.requestId;
-    return promise;
-  }
-  
-  options(url, config = {}) { 
-    const promise = this.request('OPTIONS', url, null, config);
-    promise.requestId = promise.requestId;
-    return promise;
-  }
-  
-  async upload(url, file, config = {}) {
-    const formData = new FormData();
-    formData.append('file', file);
-    
-    if (config.data) {
-      Object.entries(config.data).forEach(([key, value]) => {
-        formData.append(key, value);
-      });
     }
     
-    const uploadConfig = {
-      ...config,
-      headers: { ...config.headers }
+    throw lastErr;
+  }
+
+  _calcDelay(att, base, max = 30000) {
+    const exp = base * Math.pow(2, att - 1);
+    const jitter = exp * 0.1 * Math.random();
+    return Math.min(exp + jitter, max);
+  }
+
+  async _proc(res, cfg) {
+    const hdrs = {};
+    res.headers.forEach((v, k) => hdrs[k] = v);
+    
+    const r = {
+      dt: null,
+      status: res.status,
+      statusText: res.statusText,
+      headers: hdrs,
+      cfg
     };
     
-    if (!uploadConfig.headers['Content-Type']) {
-      delete uploadConfig.headers['Content-Type'];
+    const ct = res.headers.get('content-type') || '';
+    
+    try {
+      if (ct.includes('application/json')) {
+        const txt = await res.text();
+        r.dt = txt ? JSON.parse(txt) : null;
+      } else if (ct.includes('text/')) {
+        r.dt = await res.text();
+      } else if (ct.includes('multipart/form-data')) {
+        r.dt = await res.formData();
+      } else {
+        r.dt = await res.blob();
+      }
+    } catch (e) {
+      throw new SiosError('Parse failed', 'JSON_PARSE_ERROR', cfg, r, e);
     }
     
-    const promise = this.request('POST', url, formData, uploadConfig);
-    promise.requestId = promise.requestId;
-    return promise;
+    return r;
   }
-  
-  async multiupload(url, files, config = {}) {
-    const formData = new FormData();
+
+  _genCacheKey(method, url, params = {}, dt = null) {
+    const sorted = Object.keys(params)
+      .sort()
+      .map(k => `${k}=${JSON.stringify(params[k])}`)
+      .join('&');
+    
+    let hash = '';
+    if (dt && typeof dt === 'object') {
+      try {
+        hash = JSON.stringify(dt);
+      } catch {
+        hash = String(dt);
+      }
+    } else if (dt) hash = String(dt);
+    
+    return `${method}:${url}:${sorted}:${hash}`;
+  }
+
+  _wait(ms) {
+    return new Promise(r => setTimeout(r, ms));
+  }
+
+  _genId() {
+    return `s_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+  }
+
+  get(url, cfg = {}) {
+    return this.req('GET', url, null, cfg);
+  }
+
+  post(url, dt, cfg = {}) {
+    return this.req('POST', url, dt, cfg);
+  }
+
+  put(url, dt, cfg = {}) {
+    return this.req('PUT', url, dt, cfg);
+  }
+
+  patch(url, dt, cfg = {}) {
+    return this.req('PATCH', url, dt, cfg);
+  }
+
+  delete(url, cfg = {}) {
+    return this.req('DELETE', url, null, cfg);
+  }
+
+  head(url, cfg = {}) {
+    return this.req('HEAD', url, null, cfg);
+  }
+
+  options(url, cfg = {}) {
+    return this.req('OPTIONS', url, null, cfg);
+  }
+
+  upload(url, file, cfg = {}) {
+    const fd = new FormData();
+    fd.append('file', file);
+    if (cfg.dt) Object.entries(cfg.dt).forEach(([k, v]) => fd.append(k, v));
+    const upCfg = { ...cfg };
+    delete upCfg.headers?.['Content-Type'];
+    return this.post(url, fd, upCfg);
+  }
+
+  multiupload(url, files, cfg = {}) {
+    const fd = new FormData();
     
     if (files instanceof FileList) {
-      Array.from(files).forEach((file, index) => {
-        formData.append(`files[${index}]`, file);
-      });
+      Array.from(files).forEach((f, i) => fd.append(`files[${i}]`, f));
     } else if (Array.isArray(files)) {
-      files.forEach((file, index) => {
-        formData.append(`files[${index}]`, file);
+      files.forEach((f, i) => fd.append(`files[${i}]`, f));
+    } else if (typeof files === 'object') {
+      Object.entries(files).forEach(([field, f]) => {
+        if (Array.isArray(f)) {
+          f.forEach((item, i) => fd.append(`${field}[${i}]`, item));
+        } else fd.append(field, f);
       });
-    } else {
-      throw new SiosError('Files must be Array or FileList', 'VALIDATION_ERROR');
-    }
+    } else throw new Error('Files must be Array, FileList, or Object');
     
-    if (config.data) {
-      Object.entries(config.data).forEach(([key, value]) => {
-        formData.append(key, value);
-      });
-    }
+    if (cfg.dt) Object.entries(cfg.dt).forEach(([k, v]) => fd.append(k, v));
     
-    const uploadConfig = {
-      ...config,
-      headers: { ...config.headers }
-    };
-    
-    if (!uploadConfig.headers['Content-Type']) {
-      delete uploadConfig.headers['Content-Type'];
-    }
-    
-    const promise = this.request('POST', url, formData, uploadConfig);
-    promise.requestId = promise.requestId;
-    return promise;
+    const upCfg = { ...cfg };
+    delete upCfg.headers?.['Content-Type'];
+    return this.post(url, fd, upCfg);
   }
-  
-  intercept(type, onFulfilled, onRejected) {
-    if (!['request', 'response'].includes(type)) {
-      throw new SiosError('Invalid interceptor type', 'VALIDATION_ERROR');
-    }
-    
-    const handler = onRejected ? { onFulfilled, onRejected } : onFulfilled;
-    this.interceptors[type].push(handler);
-    
+
+  intercept(type, onOk, onFail) {
+    if (!['req', 'res'].includes(type)) throw new Error('Type must be "req" or "res"');
+    const h = onFail ? { onOk, onFail } : onOk;
+    this.icpt[type].push(h);
     return () => {
-      const index = this.interceptors[type].indexOf(handler);
-      if (index > -1) this.interceptors[type].splice(index, 1);
+      const idx = this.icpt[type].indexOf(h);
+      if (idx > -1) this.icpt[type].splice(idx, 1);
     };
   }
-  
-  create(config = {}) {
-    return new Sios({ ...this.defaults, ...config });
+
+  cancel(rid) {
+    const req = this.activeReqs.get(rid);
+    if (req) {
+      req.rState.stop = true;
+      req.abortCtrls.forEach(ctrl => {
+        if (!ctrl.signal.aborted) ctrl.abort();
+      });
+      return true;
+    }
+    return false;
+  }
+
+  cancelAll() {
+    this.activeReqs.forEach(req => {
+      req.rState.stop = true;
+      req.abortCtrls.forEach(ctrl => {
+        if (!ctrl.signal.aborted) ctrl.abort();
+      });
+    });
+    this.activeReqs.clear();
+  }
+
+  clearCache(pattern = null) {
+    if (!pattern) {
+      this.cch.clear();
+      return;
+    }
+    
+    const delKeys = [];
+    for (const k of this.cch.keys()) {
+      let del = false;
+      if (pattern instanceof RegExp) del = pattern.test(k);
+      else del = k.includes(pattern);
+      if (del) delKeys.push(k);
+    }
+    
+    delKeys.forEach(k => this.cch.delete(k));
+  }
+
+  getMetrics() {
+    return {
+      ...this.mtr,
+      active: this.activeReqs.size,
+      cache: this.cch.size
+    };
+  }
+
+  resetMetrics() {
+    this.mtr = { tot: 0, ok: 0, fail: 0, ch: 0 };
+  }
+
+  create(cfg = {}) {
+    return new Sios({ ...this.def, ...cfg });
+  }
+
+  destroy() {
+    this.cancelAll();
+    this.clearCache();
+    this.icpt = { req: [], res: [] };
   }
 }
 
 class SiosError extends Error {
-  constructor(message, code, config, response, originalError) {
-    super(message);
+  constructor(msg, code, cfg, res, orig) {
+    super(msg);
     this.name = 'SiosError';
     this.code = code;
-    this.config = config;
-    this.response = response;
-    this.originalError = originalError;
+    this.cfg = cfg;
+    this.res = res;
+    this.orig = orig;
     this.isSiosError = true;
-    this.timestamp = Date.now();
-    
-    if (Error.captureStackTrace) {
-      Error.captureStackTrace(this, SiosError);
-    }
+    this.ts = Date.now();
+    if (Error.captureStackTrace) Error.captureStackTrace(this, SiosError);
   }
   
   toJSON() {
@@ -922,7 +444,7 @@ class SiosError extends Error {
       name: this.name,
       message: this.message,
       code: this.code,
-      timestamp: this.timestamp,
+      ts: this.ts,
       stack: this.stack
     };
   }
@@ -934,6 +456,18 @@ if (typeof window !== 'undefined') {
   window.Sios = Sios;
   window.sios = sios;
   window.SiosError = SiosError;
+}
+
+if (typeof global !== 'undefined') {
+  global.Sios = Sios;
+  global.sios = sios;
+  global.SiosError = SiosError;
+}
+
+if (typeof self !== 'undefined') {
+  self.Sios = Sios;
+  self.sios = sios;
+  self.SiosError = SiosError;
 }
 
 export default sios;
